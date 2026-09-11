@@ -19,7 +19,9 @@
 #include <unistd.h>
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <mutex>
+#include <thread>
 
 #include "ApproximateClock.h"
 #include "Demangle.h"
@@ -510,7 +512,11 @@ void RocprofLogger::clearLogs() {
   // CuptiActivityProfiler clears this before the output Loggers use the data
   // for (auto &row : rows_)
   //  delete row;
-  rows_.clear();
+  {
+    std::lock_guard<std::mutex> lock(rowsMutex_);
+    rows_.clear();
+  }
+  std::lock_guard<std::mutex> lock(externalCorrelationsMutex_);
   for (int i = 0; i < CorrelationDomain::size; ++i) {
     externalCorrelations_[i].clear();
   }
@@ -811,10 +817,37 @@ void RocprofLogger::stopLogging() {
     return;
   logging_ = false;
 
-  // Flush buffers
   auto& globalContext = getGlobalContext();
-  rocprofiler_flush_buffer(globalContext.buffer);
   rocprofiler_stop_context(globalContext.context);
+
+  // Stopping the context does not wait for dispatches that are already in
+  // flight. rocprofiler-sdk emplaces a kernel dispatch record from its own
+  // signal handler thread once the dispatch completion signal fires, so
+  // records keep arriving for some time after collection stops. A single
+  // flush only delivers what has been emplaced so far, and processing the
+  // trace at that point silently drops the rest. Flush until no new records
+  // arrive.
+  constexpr int kMaxDrainAttempts = 50;
+  constexpr auto kDrainInterval = std::chrono::milliseconds(10);
+  size_t previous = std::numeric_limits<size_t>::max();
+  int attempts = 0;
+  for (; attempts < kMaxDrainAttempts; ++attempts) {
+    rocprofiler_flush_buffer(globalContext.buffer);
+    std::this_thread::sleep_for(kDrainInterval);
+    size_t current = 0;
+    {
+      std::lock_guard<std::mutex> lock(rowsMutex_);
+      current = rows_.size();
+    }
+    if (current == previous) {
+      break;
+    }
+    previous = current;
+  }
+  if (attempts == kMaxDrainAttempts) {
+    LOG(WARNING) << "Activity records were still arriving after "
+                 << kMaxDrainAttempts << " flushes; trace may be incomplete";
+  }
 }
 
 void RocprofLogger::endTracing() {
